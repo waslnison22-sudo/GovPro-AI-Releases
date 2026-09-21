@@ -1,0 +1,7 @@
+{
+  "product": "GovPro AI",
+  "channel": "beta",
+  "version": "0.1.0-beta.1",
+  "source_ref": "2f5be75f58abb7f342e756a0e3b3760a65faeff6",
+  "reason": "first-installable-beta-candidate"
+}
