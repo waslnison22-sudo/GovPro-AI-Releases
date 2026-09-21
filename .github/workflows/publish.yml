@@ -235,7 +235,7 @@ jobs:
           mapfile -t commits < <(find dist -name source-commit.txt -type f -exec cat {} \; | sort -u)
           test "${#commits[@]}" -eq 1
 
-          printf '%s\n' "${{commits[0]}}" > SOURCE_COMMIT.txt
+          printf '%s\n' "${commits[0]}" > SOURCE_COMMIT.txt
 
       - name: Create GitHub Release
         env:
