@@ -71,7 +71,7 @@ jobs:
             xdg-utils
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -155,7 +155,7 @@ jobs:
           $rows | Set-Content "SHA256SUMS-${{ inputs.version }}-${{ matrix.name }}.txt"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: govpro-ai-${{ matrix.name }}-${{ inputs.version }}
           path: |
