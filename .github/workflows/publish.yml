@@ -167,6 +167,13 @@ jobs:
         shell: bash
         run: git rev-parse HEAD > "../source-commit.txt"
 
+      - name: Set frontend build version
+        working-directory: source
+        shell: bash
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+        run: echo "VITE_APP_VERSION=$GOVPRO_VERSION" >> "$GITHUB_ENV"
+
       - name: Generate application icons
         working-directory: source/apps/desktop
         run: npm run tauri icon src-tauri/app-icon.svg
