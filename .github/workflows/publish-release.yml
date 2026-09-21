@@ -129,7 +129,9 @@ jobs:
           SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
         run: |
           mkdir -p release-assets
-          find dist -type f             ( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' )             -exec cp {} release-assets/ ;
+          find dist -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+            -exec cp {} release-assets/ \;
 
           test -n "$(find release-assets -maxdepth 1 -type f -print -quit)"
 
@@ -418,7 +420,9 @@ jobs:
         run: |
           rm -rf ../beta-assets
           mkdir -p ../beta-assets
-          find apps/desktop/src-tauri/target/release/bundle -type f             \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \)             -exec cp {} ../beta-assets/ \;
+          find apps/desktop/src-tauri/target/release/bundle -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+            -exec cp {} ../beta-assets/ \;
           test -n "$(find ../beta-assets -type f -print -quit)"
 
           python - <<'PY'
