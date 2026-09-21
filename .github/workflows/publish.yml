@@ -25,7 +25,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: govpro-release-${{ inputs.version }}
+  group: govpro-release-${{ inputs.channel }}
   cancel-in-progress: false
 
 jobs:
@@ -374,3 +374,71 @@ jobs:
           GOVPRO_VERSION: ${{ inputs.version }}
         shell: bash
         run: gh release edit "v$GOVPRO_VERSION" --draft=false
+
+      - name: Update machine-readable channel index
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          export RELEASE_URL="$(gh release view "v$GOVPRO_VERSION" --json url -q .url)"
+          gh release view "v$GOVPRO_VERSION" --json assets > published-release.json
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          channel = os.environ["CHANNEL"]
+          version = os.environ["GOVPRO_VERSION"]
+          source_ref = os.environ["SOURCE_REF"]
+          release_url = os.environ["RELEASE_URL"]
+
+          release = json.loads(Path("published-release.json").read_text(encoding="utf-8"))
+          hashes = {}
+          for line in Path("SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, path = line.split("  ", 1)
+              hashes[Path(path).name] = digest
+
+          artifacts = []
+          for asset in release["assets"]:
+              name = asset["name"]
+              if name in {"SHA256SUMS.txt", "RELEASE_METADATA.json"}:
+                  continue
+              if Path(name).suffix.lower() not in {".exe", ".msi", ".dmg", ".appimage", ".deb"}:
+                  continue
+              artifacts.append({
+                  "file": name,
+                  "bytes": asset["size"],
+                  "sha256": hashes[name],
+                  "download_url": asset["browser_download_url"],
+              })
+
+          metadata = {
+              "product": "GovPro AI",
+              "channel": channel,
+              "status": "published",
+              "latest": {
+                  "version": version,
+                  "source_ref": source_ref,
+                  "release_url": release_url,
+                  "published_at": datetime.now(timezone.utc).isoformat(),
+                  "signature_status": "not_configured",
+                  "artifacts": artifacts,
+              },
+          }
+
+          path = Path("channels") / f"{channel}.json"
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "
+", encoding="utf-8")
+          PY
+
+          git config user.name "GovPro AI Release Bot"
+          git config user.email "release-bot@govpro.ai"
+          git add "channels/$CHANNEL.json"
+          git commit -m "release: update $CHANNEL channel to v$GOVPRO_VERSION"
+          git push
