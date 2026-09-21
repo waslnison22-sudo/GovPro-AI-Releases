@@ -139,6 +139,7 @@ jobs:
           prerelease: ${{ inputs.channel == 'beta' }}
           releaseDraft: false
           uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
 
       - name: Resolve source commit
         id: source
