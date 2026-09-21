@@ -75,6 +75,7 @@ jobs:
         working-directory: source
         env:
           GOVPRO_VERSION: ${{ inputs.version }}
+          GOVPRO_CHANNEL: ${{ inputs.channel }}
         shell: bash
         run: |
           python - <<'PY'
@@ -101,6 +102,11 @@ jobs:
                   break
           cargo.write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
+
+      - name: Record source commit
+        working-directory: source
+        shell: bash
+        run: git rev-parse HEAD > "../source-commit.txt"
 
       - name: Generate application icons
         working-directory: source/apps/desktop
