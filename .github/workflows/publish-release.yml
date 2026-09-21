@@ -35,7 +35,7 @@ jobs:
       source_commit: ${{ steps.source.outputs.source_commit }}
     steps:
       - name: Checkout release repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Resolve release metadata
         id: meta
@@ -80,7 +80,7 @@ jobs:
           fi
 
       - name: Checkout engineering source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: waslnison22-sudo/Hellsaiz-Gov-AI
           ref: ${{ steps.meta.outputs.source_ref }}
@@ -113,6 +113,194 @@ jobs:
                   raise SystemExit(f"Missing heading: {heading}")
           PY
 
+  publish:
+    name: Publish Beta Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout release repository
+        uses: actions/checkout@v7
+
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: govpro-ai-beta-*
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare release assets
+        shell: bash
+        env:
+          GOVPRO_VERSION: ${{ needs.preflight.outputs.version }}
+          SOURCE_REF: ${{ needs.preflight.outputs.source_ref }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        run: |
+          mkdir -p release-assets
+          find dist -type f             ( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' )             -exec cp {} release-assets/ ;
+
+          test -n "$(find release-assets -maxdepth 1 -type f -print -quit)"
+
+          sha256sum release-assets/* > SHA256SUMS.txt
+
+          printf '%s\n' "$SOURCE_COMMIT" > SOURCE_COMMIT.txt
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          source_commit = os.environ["SOURCE_COMMIT"].strip()
+          source_ref = os.environ["SOURCE_REF"].strip()
+          version = os.environ["GOVPRO_VERSION"].strip()
+
+          artifacts = []
+          hashes = {}
+
+          for line in Path("SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, filename = line.split("  ", 1)
+              hashes[Path(filename).name] = digest
+
+          for path in sorted(Path("release-assets").iterdir()):
+              artifacts.append({
+                  "file": path.name,
+                  "bytes": path.stat().st_size,
+                  "sha256": hashes[path.name],
+              })
+
+          metadata = {
+              "product": "GovPro AI",
+              "version": version,
+              "channel": "beta",
+              "source_ref": source_ref,
+              "source_commit": source_commit,
+              "release_url": "",
+              "artifacts": artifacts,
+              "signature_status": "not_configured",
+              "signatures": [],
+          }
+
+          Path("RELEASE_METADATA.json").write_text(
+              json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ needs.preflight.outputs.version }}
+        shell: bash
+        run: |
+          gh release create "v$GOVPRO_VERSION"             release-assets/*             SHA256SUMS.txt             --draft             --prerelease             --title "GovPro AI v$GOVPRO_VERSION"             --notes-file "release-notes/v$GOVPRO_VERSION.md"
+
+      - name: Upload release metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ needs.preflight.outputs.version }}
+        shell: bash
+        run: gh release upload "v$GOVPRO_VERSION" RELEASE_METADATA.json --clobber
+
+      - name: Verify draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ needs.preflight.outputs.version }}
+        shell: bash
+        run: |
+          gh release view "v$GOVPRO_VERSION" --json name,tagName,isDraft,isPrerelease,assets > release.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("release.json").read_text(encoding="utf-8"))
+          if not data["isDraft"]:
+              raise SystemExit("Release must remain draft until final verification.")
+
+          names = {item["name"] for item in data["assets"]}
+          required = {"SHA256SUMS.txt", "RELEASE_METADATA.json"}
+          installers = {name for name in names if Path(name).suffix.lower() in {".exe", ".msi", ".dmg", ".appimage", ".deb"}}
+
+          if not required.issubset(names):
+              raise SystemExit("Release is missing required integrity metadata.")
+          if not installers:
+              raise SystemExit("Release has no installer assets.")
+          PY
+
+      - name: Publish verified Beta Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ needs.preflight.outputs.version }}
+        shell: bash
+        run: gh release edit "v$GOVPRO_VERSION" --draft=false
+
+      - name: Update Beta channel index
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ needs.preflight.outputs.version }}
+          SOURCE_REF: ${{ needs.preflight.outputs.source_ref }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        shell: bash
+        run: |
+          export RELEASE_URL="$(gh release view "v$GOVPRO_VERSION" --json url -q .url)"
+          gh release view "v$GOVPRO_VERSION" --json assets > published-release.json
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          release = json.loads(Path("published-release.json").read_text(encoding="utf-8"))
+          hashes = {}
+
+          for line in Path("SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, filename = line.split("  ", 1)
+              hashes[Path(filename).name] = digest
+
+          artifacts = []
+          for asset in release["assets"]:
+              name = asset["name"]
+              suffix = Path(name).suffix.lower()
+              if suffix not in {".exe", ".msi", ".dmg", ".appimage", ".deb"}:
+                  continue
+              artifacts.append({
+                  "file": name,
+                  "bytes": asset["size"],
+                  "sha256": hashes[name],
+                  "download_url": asset["browser_download_url"],
+              })
+
+          data = {
+              "product": "GovPro AI",
+              "channel": "beta",
+              "status": "published",
+              "latest": {
+                  "version": os.environ["GOVPRO_VERSION"],
+                  "source_ref": os.environ["SOURCE_REF"],
+                  "source_commit": os.environ["SOURCE_COMMIT"],
+                  "release_url": os.environ["RELEASE_URL"],
+                  "published_at": datetime.now(timezone.utc).isoformat(),
+                  "signature_status": "not_configured",
+                  "artifacts": artifacts,
+              },
+          }
+
+          Path("channels/beta.json").write_text(
+              json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          git config user.name "GovPro AI Release Bot"
+          git config user.email "release-bot@govpro.invalid"
+          git add channels/beta.json
+          git commit -m "release: publish beta channel v$GOVPRO_VERSION"
+          git push
+
+
   build:
     name: Build ${{ matrix.name }}
     needs: preflight
@@ -142,10 +330,10 @@ jobs:
 
     steps:
       - name: Checkout release repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Checkout engineering source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: waslnison22-sudo/Hellsaiz-Gov-AI
           ref: ${{ needs.preflight.outputs.source_ref }}
@@ -166,11 +354,9 @@ jobs:
           sudo apt-get install -y             libwebkit2gtk-4.1-dev             build-essential             curl             wget             file             libxdo-dev             libssl-dev             libayatana-appindicator3-dev             librsvg2-dev             patchelf             xdg-utils
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: source/apps/desktop/package-lock.json
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -184,7 +370,7 @@ jobs:
 
       - name: Install desktop dependencies
         working-directory: source/apps/desktop
-        run: npm ci --no-audit --no-fund
+        run: npm install --no-audit --no-fund
 
       - name: Set application version
         working-directory: source
@@ -254,7 +440,7 @@ jobs:
           PY
 
       - name: Upload Beta artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: govpro-ai-beta-${{ needs.preflight.outputs.version }}-${{ matrix.name }}
           path: |
