@@ -1,0 +1,35 @@
+name: Validate release metadata
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "channels/**"
+      - "scripts/validate_channels.py"
+      - ".github/workflows/validate-release-metadata.yml"
+  pull_request:
+    paths:
+      - "channels/**"
+      - "scripts/validate_channels.py"
+      - ".github/workflows/validate-release-metadata.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate channels and release contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Validate channel JSON
+        run: python scripts/validate_channels.py
