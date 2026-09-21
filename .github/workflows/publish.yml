@@ -59,6 +59,16 @@ jobs:
       - name: Checkout release repository
         uses: actions/checkout@v7
 
+      - name: Validate source repository credential
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "$SOURCE_REPO_TOKEN" ]; then
+            echo "::error::SOURCE_REPO_TOKEN is not configured in GovPro-AI-Releases."
+            exit 1
+          fi
+
       - name: Checkout engineering source
         uses: actions/checkout@v7
         with:
