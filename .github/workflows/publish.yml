@@ -181,6 +181,8 @@ jobs:
       - name: Build desktop bundles
         working-directory: source/apps/desktop
         shell: bash
+        env:
+          VITE_APP_VERSION: ${{ inputs.version }}
         run: |
           if [ -n "${{ matrix.target }}" ]; then
             npm run tauri build -- --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
