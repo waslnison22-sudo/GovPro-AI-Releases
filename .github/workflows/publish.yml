@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Версия GovPro AI, например 0.1.0"
+        description: "Версия GovPro AI, например 0.1.0 или 0.1.0-beta.1"
         required: true
         type: string
       source_ref:
@@ -29,9 +29,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
-    runs-on: windows-latest
-    timeout-minutes: 30
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            runner: windows-latest
+            bundles: nsis,msi
+            target: ""
+          - name: macos-arm64
+            runner: macos-latest
+            bundles: dmg
+            target: aarch64-apple-darwin
+          - name: macos-x64
+            runner: macos-latest
+            bundles: dmg
+            target: x86_64-apple-darwin
+          - name: linux-x64
+            runner: ubuntu-22.04
+            bundles: appimage,deb
+            target: ""
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
 
     steps:
       - name: Checkout release repository
@@ -45,6 +67,51 @@ jobs:
           token: ${{ secrets.SOURCE_REPO_TOKEN }}
           path: source
 
+      - name: Validate release inputs
+        working-directory: source
+        shell: bash
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+          GOVPRO_CHANNEL: ${{ inputs.channel }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["GOVPRO_VERSION"]
+          channel = os.environ["GOVPRO_CHANNEL"]
+
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+              raise SystemExit("Version must use SemVer, for example 0.1.0 or 0.1.0-beta.1")
+
+          if channel == "stable" and "-" in version:
+              raise SystemExit("Stable releases must use a non-prerelease SemVer version.")
+
+          if channel == "beta" and "-" not in version:
+              raise SystemExit("Beta releases must use a prerelease SemVer version such as 0.1.0-beta.1.")
+
+          notes = Path("../release-notes") / f"v{version}.md"
+          if not notes.exists():
+              raise SystemExit(f"Release notes file not found: {notes}")
+
+          body = notes.read_text(encoding="utf-8")
+          for heading in ("## Новое", "## Улучшено", "## Исправлено", "## Безопасность", "## Установка"):
+              if heading not in body:
+                  raise SystemExit(f"Release notes must contain heading: {heading}")
+          PY
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.name, "linux-")
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
@@ -53,7 +120,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ startsWith(matrix.name, 'macos-') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Cache Rust
         uses: swatinem/rust-cache@v2
@@ -64,18 +131,10 @@ jobs:
         working-directory: source/apps/desktop
         run: npm install --no-audit --no-fund
 
-
-      - name: Validate release inputs
-        shell: pwsh
-        env:
-          GOVPRO_VERSION: ${{ inputs.version }}
-        run: |
-          if ($env:GOVPRO_VERSION -notmatch '^[0-9]+\.[0-9]+\.[0-9]+
       - name: Set application version
         working-directory: source
         env:
           GOVPRO_VERSION: ${{ inputs.version }}
-          GOVPRO_CHANNEL: ${{ inputs.channel }}
         shell: bash
         run: |
           python - <<'PY'
@@ -84,21 +143,20 @@ jobs:
           from pathlib import Path
 
           version = os.environ["GOVPRO_VERSION"]
-          files = [
+
+          for path in (
               Path("apps/desktop/package.json"),
               Path("apps/desktop/src-tauri/tauri.conf.json"),
-          ]
-          for path in files:
+          ):
               data = json.loads(path.read_text(encoding="utf-8"))
               data["version"] = version
               path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
           cargo = Path("apps/desktop/src-tauri/Cargo.toml")
-          text = cargo.read_text(encoding="utf-8")
-          lines = text.splitlines()
-          for i, line in enumerate(lines):
+          lines = cargo.read_text(encoding="utf-8").splitlines()
+          for index, line in enumerate(lines):
               if line.startswith("version = "):
-                  lines[i] = f'version = "{version}"'
+                  lines[index] = f'version = "{version}"'
                   break
           cargo.write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
@@ -112,246 +170,154 @@ jobs:
         working-directory: source/apps/desktop
         run: npm run tauri icon src-tauri/app-icon.svg
 
-      - name: Verify frontend build
+      - name: Build desktop bundles
         working-directory: source/apps/desktop
-        run: npm run build
-
-      - name: Read release notes
-        id: notes
-        shell: pwsh
-        env:
-          GOVPRO_VERSION: ${{ inputs.version }}
+        shell: bash
         run: |
-          $path = "release-notes/v$env:GOVPRO_VERSION.md"
-          if (-not (Test-Path $path)) {
-            throw "Release notes file not found: $path"
-          }
+          if [ -n "${{ matrix.target }}" ]; then
+            npm run tauri build -- --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
+          else
+            npm run tauri build -- --bundles "${{ matrix.bundles }}"
+          fi
 
-          $body = Get-Content $path -Raw
-          "body<<GOVPRO_RELEASE_NOTES" >> $env:GITHUB_OUTPUT
-          $body >> $env:GITHUB_OUTPUT
-          "GOVPRO_RELEASE_NOTES" >> $env:GITHUB_OUTPUT
-
-      - name: Build and publish Tauri bundle
-        id: tauri
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          projectPath: source/apps/desktop
-          tagName: v${{ inputs.version }}
-          releaseName: GovPro AI v${{ inputs.version }}
-          releaseBody: ${{ steps.notes.outputs.body }}
-          prerelease: ${{ inputs.channel == 'beta' }}
-          releaseDraft: false
-          uploadUpdaterJson: false
-          uploadUpdaterSignatures: false
-
-      - name: Resolve source commit
-        id: source
+      - name: Collect release artifacts
         working-directory: source
-        shell: pwsh
+        shell: bash
         run: |
-          $commit = git rev-parse HEAD
-          "source_commit=$commit" >> $env:GITHUB_OUTPUT
+          mkdir -p "../release-assets/${{ matrix.name }}"
 
-      - name: Generate SHA-256 manifest
-        shell: pwsh
-        env:
-          GOVPRO_VERSION: ${{ inputs.version }}
-          GOVPRO_CHANNEL: ${{ inputs.channel }}
-          SOURCE_REF: ${{ inputs.source_ref }}
-          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
-          RELEASE_URL: ${{ steps.tauri.outputs.releaseHtmlUrl }}
+          find apps/desktop/src-tauri/target/release/bundle -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+            -exec cp {} "../release-assets/${{ matrix.name }}/" \;
+
+          test -n "$(find "../release-assets/${{ matrix.name }}" -type f -print -quit)"
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: govpro-release-${{ matrix.name }}-${{ inputs.version }}
+          path: |
+            release-assets/
+            source-commit.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout release repository
+        uses: actions/checkout@v7
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: govpro-release-*-${{ inputs.version }}
+          path: dist
+          merge-multiple: false
+
+      - name: Prepare release assets
+        shell: bash
         run: |
-          $bundleDir = "source/apps/desktop/src-tauri/target/release/bundle/nsis"
-          $files = Get-ChildItem $bundleDir -File
-          if ($files.Count -eq 0) {
-            throw "No NSIS artifacts found in $bundleDir"
-          }
+          mkdir -p release-assets
 
-          $rows = foreach ($file in $files) {
-            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            [PSCustomObject]@{
-              file = $file.Name
-              sha256 = $hash
-              bytes = $file.Length
-            }
-          }
+          find dist -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+            -exec cp {} release-assets/ \;
 
-          $manifest = [ordered]@{
-            product = "GovPro AI"
-            version = $env:GOVPRO_VERSION
-            channel = $env:GOVPRO_CHANNEL
-            source_ref = $env:SOURCE_REF
-            source_workflow_commit = $env:SOURCE_COMMIT
-            release_url = $env:RELEASE_URL
-            artifacts = $rows
-            signatures = @()
-            signature_status = "not_configured"
-          }
+          test -n "$(find release-assets -maxdepth 1 -type f -print -quit)"
 
-          $manifest | ConvertTo-Json -Depth 6 | Out-File "RELEASE_METADATA.json" -Encoding utf8
-          $rows | ForEach-Object { "$($_.sha256)  $($_.file)" } | Set-Content "SHA256SUMS.txt"
+          sha256sum release-assets/* > SHA256SUMS.txt
 
-      - name: Upload integrity manifests
-        shell: pwsh
+          mapfile -t commits < <(find dist -name source-commit.txt -type f -exec cat {} \; | sort -u)
+          test "${#commits[@]}" -eq 1
+
+          printf '%s\n' "${{commits[0]}}" > SOURCE_COMMIT.txt
+
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOVPRO_VERSION: ${{ inputs.version }}
-        run: |
-          gh release upload "v$env:GOVPRO_VERSION" SHA256SUMS.txt RELEASE_METADATA.json --clobber
-
-      - name: Verify release assets
-        shell: pwsh
-        env:
-          GOVPRO_VERSION: ${{ inputs.version }}
-        run: |
-          gh release view "v$env:GOVPRO_VERSION" --json name,tagName,isDraft,isPrerelease,assets
-) {
-            throw "Version must use SemVer, for example 0.1.0 or 0.1.0-beta.1."
-          }
-
-          $notes = "release-notes/v$env:GOVPRO_VERSION.md"
-          if (-not (Test-Path $notes)) {
-            throw "Release notes file not found: $notes"
-          }
-
-          $body = Get-Content $notes -Raw
-          $required = @("## Новое", "## Улучшено", "## Исправлено", "## Безопасность", "## Установка")
-          foreach ($heading in $required) {
-            if ($body -notmatch [regex]::Escape($heading)) {
-              throw "Release notes must contain heading: $heading"
-            }
-          }
-
-      - name: Set application version
-        working-directory: source
-        env:
-          GOVPRO_VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
         shell: bash
         run: |
+          prerelease_flag=""
+          if [ "$CHANNEL" = "beta" ]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          gh release create "v$GOVPRO_VERSION" \
+            release-assets/* \
+            SHA256SUMS.txt \
+            --title "GovPro AI v$GOVPRO_VERSION" \
+            --notes-file "release-notes/v$GOVPRO_VERSION.md" \
+            $prerelease_flag
+
+      - name: Generate release metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        shell: bash
+        run: |
+          export RELEASE_URL="$(gh release view "v$GOVPRO_VERSION" --json url -q .url)"
+
           python - <<'PY'
           import json
           import os
           from pathlib import Path
 
           version = os.environ["GOVPRO_VERSION"]
-          files = [
-              Path("apps/desktop/package.json"),
-              Path("apps/desktop/src-tauri/tauri.conf.json"),
-          ]
-          for path in files:
-              data = json.loads(path.read_text(encoding="utf-8"))
-              data["version"] = version
-              path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          channel = os.environ["CHANNEL"]
+          source_ref = os.environ["SOURCE_REF"]
+          release_url = os.environ["RELEASE_URL"]
+          source_commit = Path("SOURCE_COMMIT.txt").read_text(encoding="utf-8").strip()
 
-          cargo = Path("apps/desktop/src-tauri/Cargo.toml")
-          text = cargo.read_text(encoding="utf-8")
-          lines = text.splitlines()
-          for i, line in enumerate(lines):
-              if line.startswith("version = "):
-                  lines[i] = f'version = "{version}"'
-                  break
-          cargo.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          hashes = {}
+          for line in Path("SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, path = line.split("  ", 1)
+              hashes[Path(path).name] = digest
+
+          artifacts = []
+          for path in sorted(Path("release-assets").iterdir()):
+              artifacts.append({
+                  "file": path.name,
+                  "bytes": path.stat().st_size,
+                  "sha256": hashes[path.name],
+              })
+
+          metadata = {
+              "product": "GovPro AI",
+              "version": version,
+              "channel": channel,
+              "source_ref": source_ref,
+              "source_commit": source_commit,
+              "release_url": release_url,
+              "artifacts": artifacts,
+              "signature_status": "not_configured",
+              "signatures": [],
+          }
+
+          Path("RELEASE_METADATA.json").write_text(
+              json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
           PY
 
-      - name: Generate application icons
-        working-directory: source/apps/desktop
-        run: npm run tauri icon src-tauri/app-icon.svg
-
-      - name: Verify frontend build
-        working-directory: source/apps/desktop
-        run: npm run build
-
-      - name: Read release notes
-        id: notes
-        shell: pwsh
-        env:
-          GOVPRO_VERSION: ${{ inputs.version }}
-        run: |
-          $path = "release-notes/v$env:GOVPRO_VERSION.md"
-          if (-not (Test-Path $path)) {
-            throw "Release notes file not found: $path"
-          }
-
-          $body = Get-Content $path -Raw
-          "body<<GOVPRO_RELEASE_NOTES" >> $env:GITHUB_OUTPUT
-          $body >> $env:GITHUB_OUTPUT
-          "GOVPRO_RELEASE_NOTES" >> $env:GITHUB_OUTPUT
-
-      - name: Build and publish Tauri bundle
-        id: tauri
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          projectPath: source/apps/desktop
-          tagName: v${{ inputs.version }}
-          releaseName: GovPro AI v${{ inputs.version }}
-          releaseBody: ${{ steps.notes.outputs.body }}
-          prerelease: ${{ inputs.channel == 'beta' }}
-          releaseDraft: false
-          uploadUpdaterJson: false
-
-      - name: Resolve source commit
-        id: source
-        working-directory: source
-        shell: pwsh
-        run: |
-          $commit = git rev-parse HEAD
-          "source_commit=$commit" >> $env:GITHUB_OUTPUT
-
-      - name: Generate SHA-256 manifest
-        shell: pwsh
-        env:
-          GOVPRO_VERSION: ${{ inputs.version }}
-          GOVPRO_CHANNEL: ${{ inputs.channel }}
-          SOURCE_REF: ${{ inputs.source_ref }}
-          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
-          RELEASE_URL: ${{ steps.tauri.outputs.releaseHtmlUrl }}
-        run: |
-          $bundleDir = "source/apps/desktop/src-tauri/target/release/bundle/nsis"
-          $files = Get-ChildItem $bundleDir -File
-          if ($files.Count -eq 0) {
-            throw "No NSIS artifacts found in $bundleDir"
-          }
-
-          $rows = foreach ($file in $files) {
-            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            [PSCustomObject]@{
-              file = $file.Name
-              sha256 = $hash
-              bytes = $file.Length
-            }
-          }
-
-          $manifest = [ordered]@{
-            product = "GovPro AI"
-            version = $env:GOVPRO_VERSION
-            channel = $env:GOVPRO_CHANNEL
-            source_ref = $env:SOURCE_REF
-            source_workflow_commit = $env:SOURCE_COMMIT
-            release_url = $env:RELEASE_URL
-            artifacts = $rows
-            signatures = @()
-            signature_status = "not_configured"
-          }
-
-          $manifest | ConvertTo-Json -Depth 6 | Out-File "RELEASE_METADATA.json" -Encoding utf8
-          $rows | ForEach-Object { "$($_.sha256)  $($_.file)" } | Set-Content "SHA256SUMS.txt"
-
-      - name: Upload integrity manifests
-        shell: pwsh
+      - name: Upload release metadata
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOVPRO_VERSION: ${{ inputs.version }}
-        run: |
-          gh release upload "v$env:GOVPRO_VERSION" SHA256SUMS.txt RELEASE_METADATA.json --clobber
+        shell: bash
+        run: gh release upload "v$GOVPRO_VERSION" RELEASE_METADATA.json --clobber
 
-      - name: Verify release assets
-        shell: pwsh
+      - name: Verify published release
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOVPRO_VERSION: ${{ inputs.version }}
-        run: |
-          gh release view "v$env:GOVPRO_VERSION" --json name,tagName,isDraft,isPrerelease,assets
+        shell: bash
+        run: gh release view "v$GOVPRO_VERSION" --json name,tagName,isDraft,isPrerelease,assets
