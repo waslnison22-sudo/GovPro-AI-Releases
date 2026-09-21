@@ -1,0 +1,454 @@
+name: Publish GovPro AI release
+
+on:
+  workflow_dispatch: {}
+    inputs:
+      version:
+        description: "Версия GovPro AI, например 0.1.0 или 0.1.0-beta.1"
+        required: true
+        type: string
+      source_ref:
+        description: "Ветка, тег или commit инженерного репозитория"
+        required: true
+        default: "main"
+        type: string
+      channel:
+        description: "Канал релиза"
+        required: true
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - beta
+
+permissions:
+  contents: write
+
+concurrency:
+  group: govpro-release-${{ inputs.channel }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            runner: windows-latest
+            bundles: nsis,msi
+            target: ""
+          - name: macos-arm64
+            runner: macos-15
+            bundles: dmg
+            target: aarch64-apple-darwin
+          - name: macos-x64
+            runner: macos-15-intel
+            bundles: dmg
+            target: x86_64-apple-darwin
+          - name: linux-x64
+            runner: ubuntu-24.04
+            bundles: appimage,deb
+            target: ""
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout release repository
+        uses: actions/checkout@v7
+
+      - name: Validate source repository credential
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "$SOURCE_REPO_TOKEN" ]; then
+            echo "::error::SOURCE_REPO_TOKEN is not configured in GovPro-AI-Releases."
+            exit 1
+          fi
+
+      - name: Checkout engineering source
+        uses: actions/checkout@v7
+        with:
+          repository: waslnison22-sudo/Hellsaiz-Gov-AI
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: source
+
+      - name: Validate release inputs
+        working-directory: source
+        shell: bash
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+          GOVPRO_CHANNEL: ${{ inputs.channel }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["GOVPRO_VERSION"]
+          channel = os.environ["GOVPRO_CHANNEL"]
+
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+              raise SystemExit("Version must use SemVer, for example 0.1.0 or 0.1.0-beta.1")
+
+          if channel == "stable":
+              raise SystemExit("Stable publication is locked until signed release infrastructure is enabled.")
+
+
+          if channel == "beta" and "-" not in version:
+              raise SystemExit("Beta releases must use a prerelease SemVer version such as 0.1.0-beta.1.")
+
+          notes = Path("../release-notes") / f"v{version}.md"
+          if not notes.exists():
+              raise SystemExit(f"Release notes file not found: {notes}")
+
+          body = notes.read_text(encoding="utf-8")
+          for heading in ("## Новое", "## Улучшено", "## Исправлено", "## Безопасность", "## Установка"):
+              if heading not in body:
+                  raise SystemExit(f"Release notes must contain heading: {heading}")
+          PY
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.name, "linux-")
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ startsWith(matrix.name, 'macos-') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: source/apps/desktop/src-tauri -> source/apps/desktop/src-tauri/target
+
+      - name: Install desktop dependencies
+        working-directory: source/apps/desktop
+        run: npm install --no-audit --no-fund
+
+      - name: Set application version
+        working-directory: source
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ["GOVPRO_VERSION"]
+
+          for path in (
+              Path("apps/desktop/package.json"),
+              Path("apps/desktop/src-tauri/tauri.conf.json"),
+          ):
+              data = json.loads(path.read_text(encoding="utf-8"))
+              data["version"] = version
+              path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+          cargo = Path("apps/desktop/src-tauri/Cargo.toml")
+          lines = cargo.read_text(encoding="utf-8").splitlines()
+          for index, line in enumerate(lines):
+              if line.startswith("version = "):
+                  lines[index] = f'version = "{version}"'
+                  break
+          cargo.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Record source commit
+        working-directory: source
+        shell: bash
+        run: git rev-parse HEAD > "../source-commit.txt"
+
+      - name: Set frontend build version
+        working-directory: source
+        shell: bash
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+        run: echo "VITE_APP_VERSION=$GOVPRO_VERSION" >> "$GITHUB_ENV"
+
+      - name: Generate application icons
+        working-directory: source/apps/desktop
+        run: npm run tauri icon src-tauri/app-icon.svg
+
+      - name: Build desktop bundles
+        working-directory: source/apps/desktop
+        shell: bash
+        env:
+          VITE_APP_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            npm run tauri build -- --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
+          else
+            npm run tauri build -- --bundles "${{ matrix.bundles }}"
+          fi
+
+      - name: Collect release artifacts
+        working-directory: source
+        shell: bash
+        run: |
+          mkdir -p "../release-assets/${{ matrix.name }}"
+
+          find apps/desktop/src-tauri/target/release/bundle -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+            -exec cp {} "../release-assets/${{ matrix.name }}/" \;
+
+          test -n "$(find "../release-assets/${{ matrix.name }}" -type f -print -quit)"
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: govpro-release-${{ matrix.name }}-${{ inputs.version }}
+          path: |
+            release-assets/
+            source-commit.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout release repository
+        uses: actions/checkout@v7
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: govpro-release-*-${{ inputs.version }}
+          path: dist
+          merge-multiple: false
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+
+          find dist -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+            -exec cp {} release-assets/ \;
+
+          test -n "$(find release-assets -maxdepth 1 -type f -print -quit)"
+
+          sha256sum release-assets/* > SHA256SUMS.txt
+
+          mapfile -t commits < <(find dist -name source-commit.txt -type f -exec cat {} \; | sort -u)
+          test "${#commits[@]}" -eq 1
+
+          printf '%s\n' "${commits[0]}" > SOURCE_COMMIT.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+        shell: bash
+        run: |
+          prerelease_flag=""
+          if [ "$CHANNEL" = "beta" ]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          gh release create "v$GOVPRO_VERSION" \
+            release-assets/* \
+            SHA256SUMS.txt \
+            --title "GovPro AI v$GOVPRO_VERSION" \
+            --notes-file "release-notes/v$GOVPRO_VERSION.md" \
+            --draft \
+            $prerelease_flag
+
+      - name: Generate release metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        shell: bash
+        run: |
+          export RELEASE_URL="$(gh release view "v$GOVPRO_VERSION" --json url -q .url)"
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ["GOVPRO_VERSION"]
+          channel = os.environ["CHANNEL"]
+          source_ref = os.environ["SOURCE_REF"]
+          release_url = os.environ["RELEASE_URL"]
+          source_commit = Path("SOURCE_COMMIT.txt").read_text(encoding="utf-8").strip()
+
+          hashes = {}
+          for line in Path("SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, path = line.split("  ", 1)
+              hashes[Path(path).name] = digest
+
+          artifacts = []
+          for path in sorted(Path("release-assets").iterdir()):
+              artifacts.append({
+                  "file": path.name,
+                  "bytes": path.stat().st_size,
+                  "sha256": hashes[path.name],
+              })
+
+          metadata = {
+              "product": "GovPro AI",
+              "version": version,
+              "channel": channel,
+              "source_ref": source_ref,
+              "source_commit": source_commit,
+              "release_url": release_url,
+              "artifacts": artifacts,
+              "signature_status": "not_configured",
+              "signatures": [],
+          }
+
+          Path("RELEASE_METADATA.json").write_text(
+              json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload release metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: gh release upload "v$GOVPRO_VERSION" RELEASE_METADATA.json --clobber
+
+      - name: Verify release before publication
+        id: verify_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          gh release view "v$GOVPRO_VERSION" --json name,tagName,isDraft,isPrerelease,assets > release.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          with open("release.json", encoding="utf-8") as handle:
+              data = json.load(handle)
+
+          if not data.get("isDraft"):
+              raise SystemExit("Release must remain draft before publication.")
+
+          asset_names = {item["name"] for item in data.get("assets", [])}
+          required = {"SHA256SUMS.txt", "RELEASE_METADATA.json"}
+          expected_installers = {
+              ".exe", ".msi", ".dmg", ".AppImage", ".deb"
+          }
+
+          if not required.issubset(asset_names):
+              missing = ", ".join(sorted(required - asset_names))
+              raise SystemExit("Release is missing required metadata assets: " + missing)
+
+          installers = {
+              name for name in asset_names
+              if Path(name).suffix in expected_installers
+          }
+          if not installers:
+              raise SystemExit("Release is missing desktop installer assets.")
+          PY
+
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: gh release edit "v$GOVPRO_VERSION" --draft=false
+
+      - name: Update machine-readable channel index
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          export RELEASE_URL="$(gh release view "v$GOVPRO_VERSION" --json url -q .url)"
+          gh release view "v$GOVPRO_VERSION" --json assets > published-release.json
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          channel = os.environ["CHANNEL"]
+          version = os.environ["GOVPRO_VERSION"]
+          source_ref = os.environ["SOURCE_REF"]
+          release_url = os.environ["RELEASE_URL"]
+
+          release = json.loads(Path("published-release.json").read_text(encoding="utf-8"))
+          hashes = {}
+          for line in Path("SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, path = line.split("  ", 1)
+              hashes[Path(path).name] = digest
+
+          artifacts = []
+          for asset in release["assets"]:
+              name = asset["name"]
+              if name in {"SHA256SUMS.txt", "RELEASE_METADATA.json"}:
+                  continue
+              if Path(name).suffix.lower() not in {".exe", ".msi", ".dmg", ".appimage", ".deb"}:
+                  continue
+              artifacts.append({
+                  "file": name,
+                  "bytes": asset["size"],
+                  "sha256": hashes[name],
+                  "download_url": asset["browser_download_url"],
+              })
+
+          metadata = {
+              "product": "GovPro AI",
+              "channel": channel,
+              "status": "published",
+              "latest": {
+                  "version": version,
+                  "source_ref": source_ref,
+                  "release_url": release_url,
+                  "published_at": datetime.now(timezone.utc).isoformat(),
+                  "signature_status": "not_configured",
+                  "artifacts": artifacts,
+              },
+          }
+
+          path = Path("channels") / f"{channel}.json"
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "
+", encoding="utf-8")
+          PY
+
+          git config user.name "GovPro AI Release Bot"
+          git config user.email "release-bot@govpro.ai"
+          git add "channels/$CHANNEL.json"
+          git commit -m "release: update $CHANNEL channel to v$GOVPRO_VERSION"
+          git push
