@@ -1,9 +1,6 @@
 name: GovPro AI Beta Build
 
 on:
-  push:
-    paths:
-      - "release-request.json"
   workflow_dispatch:
     inputs:
       version:
