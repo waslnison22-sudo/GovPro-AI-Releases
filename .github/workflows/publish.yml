@@ -334,12 +334,30 @@ jobs:
           gh release view "v$GOVPRO_VERSION" --json name,tagName,isDraft,isPrerelease,assets > release.json
           python - <<'PY'
           import json
+          from pathlib import Path
+
           with open("release.json", encoding="utf-8") as handle:
               data = json.load(handle)
+
           if not data.get("isDraft"):
               raise SystemExit("Release must remain draft before publication.")
-          if len(data.get("assets", [])) < 2:
-              raise SystemExit("Release is missing expected assets.")
+
+          asset_names = {item["name"] for item in data.get("assets", [])}
+          required = {"SHA256SUMS.txt", "RELEASE_METADATA.json"}
+          expected_installers = {
+              ".exe", ".msi", ".dmg", ".AppImage", ".deb"
+          }
+
+          if not required.issubset(asset_names):
+              missing = ", ".join(sorted(required - asset_names))
+              raise SystemExit("Release is missing required metadata assets: " + missing)
+
+          installers = {
+              name for name in asset_names
+              if Path(name).suffix in expected_installers
+          }
+          if not installers:
+              raise SystemExit("Release is missing desktop installer assets.")
           PY
 
       - name: Publish verified release
