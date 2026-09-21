@@ -42,19 +42,11 @@ jobs:
           INPUT_SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           python - <<'PY'
-          import json
           import os
           import re
-          from pathlib import Path
 
           version = os.environ.get("INPUT_VERSION", "").strip()
           source_ref = os.environ.get("INPUT_SOURCE_REF", "").strip()
-
-          request = Path("release-request.json")
-          if request.exists():
-              data = json.loads(request.read_text(encoding="utf-8"))
-              version = str(data.get("version", version)).strip()
-              source_ref = str(data.get("source_ref", source_ref)).strip()
 
           if not re.fullmatch(r"\d+\.\d+\.\d+-[0-9A-Za-z.-]+", version):
               raise SystemExit("Beta version must be prerelease SemVer, for example 0.1.0-beta.1")
@@ -343,6 +335,12 @@ jobs:
         env:
           EXPECTED_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_COMMIT"
+
+      - name: Record source commit for artifact bundle
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        run: printf '%s\n' "$SOURCE_COMMIT" > SOURCE_COMMIT.txt
 
       - name: Install Linux dependencies
         if: startsWith(matrix.name, 'linux-')
