@@ -4,7 +4,6 @@ on:
   push:
     paths:
       - "release-request.json"
-      - ".github/workflows/publish-release.yml"
   workflow_dispatch:
     inputs:
       version:
