@@ -38,12 +38,12 @@ Workflow:
 2. выставляет единую версию приложения;
 3. генерирует production-иконки;
 4. собирает frontend;
-5. собирает Windows NSIS installer;
-6. создаёт GitHub Release;
-7. считает SHA-256;
-8. публикует SHA256SUMS.txt;
-9. публикует RELEASE_METADATA.json;
-10. проверяет наличие опубликованных assets.
+5. параллельно собирает Windows x64, macOS Intel, macOS Apple Silicon и Linux x64;
+6. проверяет, что все платформы собраны из одного engineering commit;
+7. создаёт единый GitHub Release;
+8. считает SHA-256 для всех установочных файлов;
+9. публикует SHA256SUMS.txt и RELEASE_METADATA.json;
+10. проверяет опубликованные assets.
 
 ## Почему сейчас нет автоматической подписи
 
