@@ -1,0 +1,188 @@
+name: Publish GovPro AI release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия GovPro AI, например 0.1.0"
+        required: true
+        type: string
+      source_ref:
+        description: "Ветка, тег или commit инженерного репозитория"
+        required: true
+        default: "main"
+        type: string
+      channel:
+        description: "Канал релиза"
+        required: true
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - beta
+
+permissions:
+  contents: write
+
+concurrency:
+  group: govpro-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout release repository
+        uses: actions/checkout@v7
+
+      - name: Checkout engineering source
+        uses: actions/checkout@v7
+        with:
+          repository: waslnison22-sudo/Hellsaiz-Gov-AI
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: source
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: source/apps/desktop/src-tauri -> source/apps/desktop/src-tauri/target
+
+      - name: Install desktop dependencies
+        working-directory: source/apps/desktop
+        run: npm install --no-audit --no-fund
+
+      - name: Set application version
+        working-directory: source
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ["GOVPRO_VERSION"]
+          files = [
+              Path("apps/desktop/package.json"),
+              Path("apps/desktop/src-tauri/tauri.conf.json"),
+          ]
+          for path in files:
+              data = json.loads(path.read_text(encoding="utf-8"))
+              data["version"] = version
+              path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+          cargo = Path("apps/desktop/src-tauri/Cargo.toml")
+          text = cargo.read_text(encoding="utf-8")
+          lines = text.splitlines()
+          for i, line in enumerate(lines):
+              if line.startswith("version = "):
+                  lines[i] = f'version = "{version}"'
+                  break
+          cargo.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Generate application icons
+        working-directory: source/apps/desktop
+        run: npm run tauri icon src-tauri/app-icon.svg
+
+      - name: Verify frontend build
+        working-directory: source/apps/desktop
+        run: npm run build
+
+      - name: Read release notes
+        id: notes
+        shell: pwsh
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+        run: |
+          $path = "release-notes/v$env:GOVPRO_VERSION.md"
+          if (-not (Test-Path $path)) {
+            throw "Release notes file not found: $path"
+          }
+
+          $body = Get-Content $path -Raw
+          "body<<GOVPRO_RELEASE_NOTES" >> $env:GITHUB_OUTPUT
+          $body >> $env:GITHUB_OUTPUT
+          "GOVPRO_RELEASE_NOTES" >> $env:GITHUB_OUTPUT
+
+      - name: Build and publish Tauri bundle
+        id: tauri
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: source/apps/desktop
+          tagName: v${{ inputs.version }}
+          releaseName: GovPro AI v${{ inputs.version }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          prerelease: ${{ inputs.channel == 'beta' }}
+          releaseDraft: false
+          uploadUpdaterJson: false
+
+      - name: Generate SHA-256 manifest
+        shell: pwsh
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+          GOVPRO_CHANNEL: ${{ inputs.channel }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_URL: ${{ steps.tauri.outputs.releaseHtmlUrl }}
+        run: |
+          $bundleDir = "source/apps/desktop/src-tauri/target/release/bundle/nsis"
+          $files = Get-ChildItem $bundleDir -File
+          if ($files.Count -eq 0) {
+            throw "No NSIS artifacts found in $bundleDir"
+          }
+
+          $rows = foreach ($file in $files) {
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            [PSCustomObject]@{
+              file = $file.Name
+              sha256 = $hash
+              bytes = $file.Length
+            }
+          }
+
+          $manifest = [ordered]@{
+            product = "GovPro AI"
+            version = $env:GOVPRO_VERSION
+            channel = $env:GOVPRO_CHANNEL
+            source_ref = $env:SOURCE_REF
+            source_workflow_commit = $env:SOURCE_COMMIT
+            release_url = $env:RELEASE_URL
+            artifacts = $rows
+            signatures = @()
+            signature_status = "not_configured"
+          }
+
+          $manifest | ConvertTo-Json -Depth 6 | Out-File "RELEASE_METADATA.json" -Encoding utf8
+          $rows | ForEach-Object { "$($_.sha256)  $($_.file)" } | Set-Content "SHA256SUMS.txt"
+
+      - name: Upload integrity manifests
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOVPRO_VERSION: ${{ inputs.version }}
+        run: |
+          gh release upload "v$env:GOVPRO_VERSION" SHA256SUMS.txt RELEASE_METADATA.json --clobber
+
+      - name: Verify release assets
+        shell: pwsh
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+        run: |
+          gh release view "v$env:GOVPRO_VERSION" --json name,tagName,isDraft,isPrerelease,assets
