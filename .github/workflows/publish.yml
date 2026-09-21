@@ -85,8 +85,9 @@ jobs:
           if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
               raise SystemExit("Version must use SemVer, for example 0.1.0 or 0.1.0-beta.1")
 
-          if channel == "stable" and "-" in version:
-              raise SystemExit("Stable releases must use a non-prerelease SemVer version.")
+          if channel == "stable":
+              raise SystemExit("Stable publication is locked until signed release infrastructure is enabled.")
+
 
           if channel == "beta" and "-" not in version:
               raise SystemExit("Beta releases must use a prerelease SemVer version such as 0.1.0-beta.1.")
