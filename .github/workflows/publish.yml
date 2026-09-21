@@ -133,13 +133,21 @@ jobs:
           releaseDraft: false
           uploadUpdaterJson: false
 
+      - name: Resolve source commit
+        id: source
+        working-directory: source
+        shell: pwsh
+        run: |
+          $commit = git rev-parse HEAD
+          "source_commit=$commit" >> $env:GITHUB_OUTPUT
+
       - name: Generate SHA-256 manifest
         shell: pwsh
         env:
           GOVPRO_VERSION: ${{ inputs.version }}
           GOVPRO_CHANNEL: ${{ inputs.channel }}
           SOURCE_REF: ${{ inputs.source_ref }}
-          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
           RELEASE_URL: ${{ steps.tauri.outputs.releaseHtmlUrl }}
         run: |
           $bundleDir = "source/apps/desktop/src-tauri/target/release/bundle/nsis"
