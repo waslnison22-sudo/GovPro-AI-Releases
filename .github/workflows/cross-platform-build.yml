@@ -1,0 +1,169 @@
+name: Cross-platform desktop build verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия для проверки сборок"
+        required: true
+        default: "0.1.0"
+        type: string
+      source_ref:
+        description: "Ветка, тег или commit инженерного репозитория"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: govpro-cross-platform-build-${{ inputs.version }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            runner: windows-latest
+            bundles: nsis,msi
+            target: ""
+          - name: macos-arm64
+            runner: macos-latest
+            bundles: dmg
+            target: aarch64-apple-darwin
+          - name: macos-x64
+            runner: macos-latest
+            bundles: dmg
+            target: x86_64-apple-darwin
+          - name: linux-x64
+            runner: ubuntu-22.04
+            bundles: appimage,deb
+            target: ""
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout release repository
+        uses: actions/checkout@v7
+
+      - name: Checkout engineering source
+        uses: actions/checkout@v7
+        with:
+          repository: waslnison22-sudo/Hellsaiz-Gov-AI
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: source
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.name, 'linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ startsWith(matrix.name, 'macos-') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: source/apps/desktop/src-tauri -> source/apps/desktop/src-tauri/target
+
+      - name: Install desktop dependencies
+        working-directory: source/apps/desktop
+        run: npm install --no-audit --no-fund
+
+      - name: Set application version
+        working-directory: source
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ["GOVPRO_VERSION"]
+          for path in (
+              Path("apps/desktop/package.json"),
+              Path("apps/desktop/src-tauri/tauri.conf.json"),
+          ):
+              data = json.loads(path.read_text(encoding="utf-8"))
+              data["version"] = version
+              path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+          cargo = Path("apps/desktop/src-tauri/Cargo.toml")
+          text = cargo.read_text(encoding="utf-8")
+          lines = text.splitlines()
+          for index, line in enumerate(lines):
+              if line.startswith("version = "):
+                  lines[index] = f'version = "{version}"'
+                  break
+          cargo.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Generate application icons
+        working-directory: source/apps/desktop
+        run: npm run tauri icon src-tauri/app-icon.svg
+
+      - name: Build desktop bundles
+        working-directory: source/apps/desktop
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            npm run tauri build -- --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
+          else
+            npm run tauri build -- --bundles "${{ matrix.bundles }}"
+          fi
+
+      - name: Generate SHA-256 manifest
+        working-directory: source
+        shell: pwsh
+        env:
+          GOVPRO_VERSION: ${{ inputs.version }}
+        run: |
+          $bundleDir = "apps/desktop/src-tauri/target"
+          $files = Get-ChildItem $bundleDir -Recurse -File |
+            Where-Object { $_.Extension -in ".exe", ".msi", ".dmg", ".AppImage", ".deb" }
+
+          if ($files.Count -eq 0) {
+            throw "No expected release artifacts were produced."
+          }
+
+          $rows = foreach ($file in $files) {
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($file.FullName.Replace((Get-Location).Path + '\', ''))"
+          }
+
+          $rows | Set-Content "SHA256SUMS-${{ inputs.version }}-${{ matrix.name }}.txt"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: govpro-ai-${{ matrix.name }}-${{ inputs.version }}
+          path: |
+            source/apps/desktop/src-tauri/target/**/**/*.exe
+            source/apps/desktop/src-tauri/target/**/**/*.msi
+            source/apps/desktop/src-tauri/target/**/**/*.dmg
+            source/apps/desktop/src-tauri/target/**/**/*.AppImage
+            source/apps/desktop/src-tauri/target/**/**/*.deb
+            source/SHA256SUMS-${{ inputs.version }}-${{ matrix.name }}.txt
+          if-no-files-found: error
+          retention-days: 14
